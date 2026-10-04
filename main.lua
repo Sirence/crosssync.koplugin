@@ -26,7 +26,7 @@ local T = require("ffi/util").template
 
 
 local TUNABLES = {
-    stats_idle = { default = 300, min = 5, max = 600, step = 5 },         -- timeout without a page turn - maybe fell asleep lol
+    stats_idle = { default = 300, min = 5, max = 600, step = 5 },         -- timeout without a page turn
     stats_min_page = { default = 5, min = 0, max = 60, step = 1 },       -- don't push skimmed pages
     stats_history_days = { default = 730, min = 30, max = 730, step = 30 },
     push_delay = { default = 20, min = 5, max = 300, step = 5 },         -- seconds after the last page turn
