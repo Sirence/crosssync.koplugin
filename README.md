@@ -1,5 +1,7 @@
 # CrossPoint Sync (KOReader plugin)
 
+CrossPoint Sync is a KOReader plugin that syncs your reading progress, highlights, bookmarks, reading status and reading stats with a CrossPoint sync server.
+
 Copy the `crosspointsync.koplugin` folder to KOReader's `plugins/` directory, restart KOReader,
 then **Tools → CrossPoint Sync → Account & server**.
 
