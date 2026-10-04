@@ -23,10 +23,6 @@ Turn off KOReader's built-in *Progress sync* so progress is not uploaded twice.
 * You can set Reading, Paused, Finished, Did not finish, or Automatic from the menu.
 * KOReader's own "On hold" and "Finished" markers are forwarded automatically.
 
-**With no book open**
-* Menu Entry: Push all books (not unread) goes through your reading history and sends every book you've started. It skips progress when the server is further ahead and stops early if the server can't be reached.
-* Long-pressing a book in the file manager lets you push its progress, highlights, book info or reading stats.
-
 ## Where things are
 
 **Book open (Tools → CrossPoint Sync):** sync everything, push / pull progress, highlights and
@@ -35,9 +31,6 @@ bookmarks, book info, reading status, reading stats.
 **No book open (file manager, Tools → CrossPoint Sync):** account & server, *Push all books
 (not unread)*, send reading stats. "Push all" goes through the reading history, skips books that
 were never started, and does not overwrite progress when the server is further ahead.
-
-**Long-press a book in the file manager:** CrossPoint: progress / highlights / book info / reading stats.
-(Needs a KOReader version that supports `addFileDialogButtons`; without it the entries just don't appear.)
 
 ## Limits
 
