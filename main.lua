@@ -24,10 +24,13 @@ local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
-local STATS_IDLE = 30            -- timeout without a page turn - maybe fell asleep lol
-local STATS_MIN_PAGE = 2         -- don't push skimmed pages
-local STATS_HISTORY_DAYS = 730
-local PUSH_DELAY = 20            -- seconds after the last page turn
+
+local TUNABLES = {
+    stats_idle = { default = 30, min = 5, max = 600, step = 5 },         -- timeout without a page turn - maybe fell asleep lol
+    stats_min_page = { default = 2, min = 0, max = 30, step = 1 },       -- don't push skimmed pages
+    stats_history_days = { default = 730, min = 30, max = 730, step = 30 },
+    push_delay = { default = 20, min = 5, max = 300, step = 5 },         -- seconds after the last page turn
+}
 
 local STATUS_LABELS = {
     reading = _("Reading"), paused = _("Paused"),
@@ -235,6 +238,12 @@ end
 function CrossPointSync:setSetting(key, value)
     self.settings:saveSetting(key, value)
     self.settings:flush()
+end
+
+function CrossPointSync:tunable(key)
+    local t = TUNABLES[key]
+    local v = tonumber(self:getSetting(key, t.default)) or t.default
+    return math.max(t.min, math.min(t.max, v))
 end
 
 function CrossPointSync:notify(text, timeout)
@@ -849,7 +858,7 @@ function CrossPointSync:statsOnPage(pageno)
     local elapsed = c.last and (now - c.last) or nil
     local delta = c.last_page and (pageno - c.last_page) or 0
 
-    if elapsed and elapsed <= STATS_IDLE then
+    if elapsed and elapsed <= self:tunable("stats_idle") then
         self:statsAddTime(b, elapsed, now)
     else
         c.session_counted = false
@@ -860,7 +869,7 @@ function CrossPointSync:statsOnPage(pageno)
     if c.last_page and delta ~= 0 and math.abs(delta) <= 3 then
         b.pages = b.pages + 1
         local pct = self:getLocalProgress().percentage
-        if delta > 0 and elapsed and elapsed >= STATS_MIN_PAGE then
+        if delta > 0 and elapsed and elapsed >= self:tunable("stats_min_page") then
             b.pace_n = b.pace_n + 1
             b.pace_seconds = b.pace_seconds + elapsed
             if b.last_pct and pct > b.last_pct then
@@ -931,12 +940,13 @@ function CrossPointSync:statsGlobalSnapshot(snapshots)
     for _i, d in ipairs(self.stats.days) do days[#days + 1] = d end
     table.sort(days)
     local anchor = statsDay(os.time())
+    local history_days = self:tunable("stats_history_days")
     local bits = {}
-    for i = 1, math.ceil(STATS_HISTORY_DAYS / 8) do bits[i] = 0 end
+    for i = 1, math.ceil(history_days / 8) do bits[i] = 0 end
     local streak, run = 0, 0
     for i, day in ipairs(days) do
         local n = anchor - day    
-        if n >= 0 and n < STATS_HISTORY_DAYS then
+        if n >= 0 and n < history_days then
             local idx = math.floor(n / 8) + 1
             bits[idx] = bits[idx] + 2 ^ (n % 8) 
         end
@@ -1195,7 +1205,7 @@ function CrossPointSync:onPageUpdate(pageno)
             self:autoPush()
         end
         self.push_scheduled = true
-        UIManager:scheduleIn(PUSH_DELAY, self._push_fn)
+        UIManager:scheduleIn(self:tunable("push_delay"), self._push_fn)
     end
 end
 
@@ -1345,6 +1355,34 @@ function CrossPointSync:toggleItem(text, key, default, help)
     }
 end
 
+function CrossPointSync:numberItem(text, key, unit, help)
+    local t = TUNABLES[key]
+    return {
+        text_func = function() return T(_("%1: %2 %3"), text, self:tunable(key), unit) end,
+        help_text = help,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            local SpinWidget = require("ui/widget/spinwidget")
+            UIManager:show(SpinWidget:new{
+                title_text = text,
+                info_text = help,
+                value = self:tunable(key),
+                value_min = t.min,
+                value_max = t.max,
+                value_step = t.step,
+                value_hold_step = t.step * 5,
+                default_value = t.default,
+                unit = unit,
+                ok_text = _("Set"),
+                callback = function(spin)
+                    self:setSetting(key, spin.value)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            })
+        end,
+    }
+end
+
 function CrossPointSync:radioItems(key, default, options)
     local items = {}
     for _i, o in ipairs(options) do
@@ -1410,6 +1448,19 @@ function CrossPointSync:settingsMenu()
         self:toggleItem(_("Also store progress under the other document id"), "write_alias", true,
             _("Lets devices that match by binary hash and devices that match by filename see the same progress.")),
         self:toggleItem(_("Track and send reading stats"), "send_stats", true),
+        {
+            text = _("Timing"),
+            sub_item_table = {
+                self:numberItem(_("Stats: idle timeout"), "stats_idle", _("seconds"),
+                    _("No page turn for this long ends the reading session; time after it is not counted.")),
+                self:numberItem(_("Stats: shortest page time for pace"), "stats_min_page", _("seconds"),
+                    _("Page turns quicker than this count as skimming and are left out of the pace and ETA. 0 counts every page.")),
+                self:numberItem(_("Stats: reading history length"), "stats_history_days", _("days"),
+                    _("How many days of reading streak history are sent.")),
+                self:numberItem(_("Push delay while reading"), "push_delay", _("seconds"),
+                    _("Seconds after the last page turn before progress is uploaded (needs \"Also push while reading\").")),
+            },
+        },
     }
 end
 
