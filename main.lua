@@ -257,7 +257,24 @@ function CrossPointSync:isConfigured()
 end
 
 function CrossPointSync:withNetwork(callback)
-    NetworkMgr:runWhenOnline(callback)
+    local was_connected = NetworkMgr:isConnected()
+    NetworkMgr:runWhenOnline(function()
+        local finished = false
+        local function done()
+            if finished then return end
+            finished = true
+            if not was_connected then
+                UIManager:scheduleIn(1, function() NetworkMgr:afterWifiAction() end)
+            end
+        end
+        local ok, async = pcall(callback, done)
+        if not ok then
+            logger.warn("CrossPointSync: network action failed:", async)
+            done()
+        elseif async ~= true then
+            done()
+        end
+    end)
 end
 
 function CrossPointSync:onlineOrAsk(callback)
@@ -1094,7 +1111,7 @@ function CrossPointSync:pushBookData(file, summary)
 end
 
 function CrossPointSync:pushAllBooks()
-    self:onlineOrAsk(function()
+    self:onlineOrAsk(function(done)
         local ReadHistory = require("readhistory")
         local files, seen = {}, {}
         for _i, item in ipairs(ReadHistory.hist or {}) do
@@ -1134,6 +1151,7 @@ function CrossPointSync:pushAllBooks()
             if summary.unread > 0 then lines[#lines + 1] = T(_("%1 unread book(s) skipped."), summary.unread) end
             if summary.failed > 0 then lines[#lines + 1] = T(_("%1 book(s) failed."), summary.failed) end
             self:notify(table.concat(lines, "\n"), 8)
+            done()
         end
         local function step()
             i = i + 1
@@ -1150,6 +1168,7 @@ function CrossPointSync:pushAllBooks()
             end)
         end
         step()
+        return true -- asynchronous
     end)
 end
 
