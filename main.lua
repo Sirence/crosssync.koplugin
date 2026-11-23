@@ -4,6 +4,7 @@ CrossPoint Sync for KOReader
 
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
+local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
@@ -275,6 +276,31 @@ function CrossPointSync:withNetwork(callback)
             done()
         end
     end)
+end
+
+function CrossPointSync:runOnlineBlocking(callback)
+    if NetworkMgr:isConnected() then
+        pcall(callback)
+        return
+    end
+    if not (Device:hasWifiToggle() and NetworkMgr.goOnlineToRun) then return end
+    local prev_action = G_reader_settings:readSetting("wifi_enable_action")
+    G_reader_settings:saveSetting("wifi_enable_action", "turn_on")
+    local ok, err = pcall(function()
+        NetworkMgr:goOnlineToRun(function() pcall(callback) end)
+    end)
+    if prev_action == nil then
+        G_reader_settings:delSetting("wifi_enable_action")
+    else
+        G_reader_settings:saveSetting("wifi_enable_action", prev_action)
+    end
+    if not ok then logger.warn("CrossPointSync: could not go online:", err) end
+    if NetworkMgr:getBeforeActionFlag() then
+        NetworkMgr:clearBeforeActionFlag()
+        if G_reader_settings:readSetting("wifi_disable_action") ~= "leave_on" then
+            pcall(function() NetworkMgr:disableWifi() end)
+        end
+    end
 end
 
 function CrossPointSync:onlineOrAsk(callback)
@@ -1035,8 +1061,12 @@ function CrossPointSync:syncAll()
     end)
 end
 
+function CrossPointSync:wantsAutoPush()
+    return self:getSetting("auto_push", true) and self:isConfigured() and self.ui.document
+end
+
 function CrossPointSync:autoPush()
-    if not (self:getSetting("auto_push", true) and self:isConfigured() and self.ui.document) then return end
+    if not self:wantsAutoPush() then return end
     if not NetworkMgr:isConnected() then return end
     pcall(function() self:syncProgress(self:readerContext(), "push", true) end)
 end
@@ -1236,20 +1266,33 @@ function CrossPointSync:onCloseDocument()
     if not self.ui.document then return end
     pcall(function() self:statsEnd() end)
     pcall(function() self:flushStats() end)
-    self:autoPush()
-    if self:isConfigured() and NetworkMgr:isConnected() then
+    if not self:isConfigured() then return end
+    local push = self:wantsAutoPush()
+    local function work()
+        if push then
+            pcall(function() self:syncProgress(self:readerContext(), "push", true) end)
+        end
         pcall(function()
             local ctx = self:readerContext()
             if ctx then self:syncKoreaderStatus(ctx) end
         end)
         if self:getSetting("send_stats", true) then pcall(function() self:uploadStats() end) end
     end
+    if push then
+        self:runOnlineBlocking(work)
+    elseif NetworkMgr:isConnected() then
+        work()
+    end
 end
 
 function CrossPointSync:onSuspend()
     pcall(function() self:statsEnd() end)
     pcall(function() self:flushStats() end)
-    if self.ui.document then self:autoPush() end
+    if self:wantsAutoPush() then
+        self:runOnlineBlocking(function()
+            self:syncProgress(self:readerContext(), "push", true)
+        end)
+    end
 end
 
 function CrossPointSync:onResume()
