@@ -38,6 +38,12 @@ local STATUS_LABELS = {
     finished = _("Finished"), dnf = _("Did not finish"),
 }
 
+local PUSH_STATUSES = {
+    { "reading", _("Reading") },
+    { "abandoned", _("On hold") },
+    { "complete", _("Finished") },
+}
+
 local CrossPointSync = WidgetContainer:extend{
     name = "crosspointsync",
     is_doc_only = false,
@@ -640,6 +646,10 @@ function CrossPointSync:syncProgress(ctx, mode, silent)
     local local_p = ctx.progress
 
     if mode == "push" then
+        if silent then
+            local remote = self:fetchRemote(ids.primary)
+            if remote and compare(local_p, remote) == "synced" then return end
+        end
         local ok, err = self:uploadProgress(ctx, ids, local_p)
         if not silent then
             self:notify(ok and T(_("Progress uploaded (%1)."), formatPercent(local_p.percentage))
@@ -720,7 +730,7 @@ function CrossPointSync:syncProgress(ctx, mode, silent)
         if not silent then self:notify(_("Already in sync.")) end
         return
     end
-    if result == "local" or not same_device then
+    if result == "local" then
         local ok, e = self:uploadProgress(ctx, ids, local_p)
         if not silent then
             self:notify(ok and T(_("Uploaded local progress (%1)."), formatPercent(local_p.percentage))
@@ -1062,7 +1072,9 @@ function CrossPointSync:syncAll()
 end
 
 function CrossPointSync:wantsAutoPush()
-    return self:getSetting("auto_push", true) and self:isConfigured() and self.ui.document
+    if not (self:getSetting("auto_push", true) and self:isConfigured() and self.ui.document) then return false end
+    local ok, ctx = pcall(function() return self:readerContext() end)
+    return not (ok and ctx) or self:ctxStatusEnabled(ctx)
 end
 
 function CrossPointSync:autoPush()
@@ -1100,10 +1112,25 @@ local function bookStarted(ctx)
     return ctx.progress ~= nil or ctx.status == "reading" or ctx.status == "complete" or ctx.status == "abandoned"
 end
 
+function CrossPointSync:pushStatusEnabled(status)
+    local enabled = self:getSetting("push_statuses", {})
+    return enabled[status] ~= false
+end
+
+function CrossPointSync:ctxStatusEnabled(ctx)
+    local status = ctx.status
+    if status ~= "abandoned" and status ~= "complete" then status = "reading" end
+    return self:pushStatusEnabled(status)
+end
+
 function CrossPointSync:pushBookData(file, summary)
     local ctx = self:fileContext(file)
     if not bookStarted(ctx) then
         summary.unread = summary.unread + 1
+        return
+    end
+    if not self:ctxStatusEnabled(ctx) then
+        summary.filtered = summary.filtered + 1
         return
     end
     local ok_all, last_err = true, nil
@@ -1119,8 +1146,10 @@ function CrossPointSync:pushBookData(file, summary)
     if ctx.progress then
         local ids = self:idsFor(ctx)
         local remote = self:fetchRemote(ids.primary)
-        if remote and (remote.percentage or 0) > ctx.progress.percentage + 0.001
-                and remote.device_id ~= self:getSetting("device_id") then
+        local result = remote and compare(ctx.progress, remote)
+        if result == "synced" then
+            summary.same = summary.same + 1
+        elseif result == "remote" and remote.device_id ~= self:getSetting("device_id") then
             summary.behind = summary.behind + 1
         else
             track(self:uploadProgress(ctx, ids, ctx.progress))
@@ -1156,7 +1185,7 @@ function CrossPointSync:pushAllBooks()
             return
         end
 
-        local summary = { pushed = 0, unread = 0, behind = 0, failed = 0, fail_streak = 0 }
+        local summary = { pushed = 0, unread = 0, filtered = 0, same = 0, behind = 0, failed = 0, fail_streak = 0 }
         local total, i, msg = #files, 0, nil
         local function show(text)
             if msg then UIManager:close(msg) end
@@ -1175,10 +1204,16 @@ function CrossPointSync:pushAllBooks()
             end
             if msg then UIManager:close(msg) end
             table.insert(lines, 1, T(_("Pushed %1 book(s)."), summary.pushed))
+            if summary.same > 0 then
+                lines[#lines + 1] = T(_("%1 book(s): progress already up to date on the server."), summary.same)
+            end
             if summary.behind > 0 then
                 lines[#lines + 1] = T(_("%1 book(s): progress not sent, the server is further ahead."), summary.behind)
             end
             if summary.unread > 0 then lines[#lines + 1] = T(_("%1 unread book(s) skipped."), summary.unread) end
+            if summary.filtered > 0 then
+                lines[#lines + 1] = T(_("%1 book(s) skipped because of their status."), summary.filtered)
+            end
             if summary.failed > 0 then lines[#lines + 1] = T(_("%1 book(s) failed."), summary.failed) end
             self:notify(table.concat(lines, "\n"), 8)
             done()
@@ -1478,6 +1513,24 @@ function CrossPointSync:statusMenu()
     return items
 end
 
+function CrossPointSync:pushStatusMenu()
+    local items = {}
+    for _i, o in ipairs(PUSH_STATUSES) do
+        local key = o[1]
+        items[#items + 1] = {
+            text = o[2],
+            keep_menu_open = true,
+            checked_func = function() return self:pushStatusEnabled(key) end,
+            callback = function()
+                local enabled = util.tableDeepCopy(self:getSetting("push_statuses", {}))
+                enabled[key] = not self:pushStatusEnabled(key)
+                self:setSetting("push_statuses", enabled)
+            end,
+        }
+    end
+    return items
+end
+
 function CrossPointSync:settingsMenu()
     return {
         {
@@ -1502,6 +1555,11 @@ function CrossPointSync:settingsMenu()
                 { "silent", _("Go there automatically") },
                 { "never", _("Do nothing") },
             }),
+        },
+        {
+            text = _("Push only books with status"),
+            help_text = _("Automatic pushes and \"Push all books\" only send books whose KOReader status is checked here. Started books without a status count as Reading."),
+            sub_item_table_func = function() return self:pushStatusMenu() end,
         },
         self:toggleItem(_("Check progress when opening a book"), "auto_pull", true),
         self:toggleItem(_("Push progress on close / suspend"), "auto_push", true),
