@@ -22,6 +22,10 @@ Turn off KOReader's built-in *Progress sync* so progress is not uploaded twice.
 * Works for EPUB and PDF. "Sync all highlights and bookmarks" sends them for every book in the reading history without opening the books (also available as a gesture action).
 * Title, author, file name and file size are sent as book info.
 
+* **CrossPoint Library**
+* "CrossPoint Library" shows your account's stats and your books.
+* Tap a book for details.
+
 **Reading status**
 * You can set Reading, Paused, Finished, Did not finish, or Automatic from the menu.
 * KOReader's own "On hold" and "Finished" markers are forwarded automatically.
