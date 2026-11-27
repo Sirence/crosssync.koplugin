@@ -234,6 +234,8 @@ function CrossPointSync:onDispatcherRegisterActions()
         title = _("CrossPoint: sync everything"), reader = true })
     Dispatcher:registerAction("crosspoint_push_all_books", { category = "none", event = "CrossPointPushAllBooks",
         title = _("CrossPoint: push all books"), general = true, filemanager = true })
+    Dispatcher:registerAction("crosspoint_show_library", { category = "none", event = "CrossPointShowLibrary",
+        title = _("CrossPoint: browse library"), general = true })
     Dispatcher:registerAction("crosspoint_sync_all_annotations", { category = "none", event = "CrossPointSyncAllAnnotations",
         title = _("CrossPoint: sync all highlights and bookmarks"), general = true })
 end
@@ -313,7 +315,7 @@ end
 
 function CrossPointSync:onlineOrAsk(callback)
     if not self:isConfigured() then
-        self:notify(_("Set the server, username and password first (Tools → CrossPoint Sync → Account & server)."))
+        self:notify(_("Set the server, username and password first (Tools → CrossPoint Sync → Settings → Account & server)."))
         return
     end
     self:withNetwork(callback)
@@ -641,7 +643,7 @@ end
 function CrossPointSync:syncProgress(ctx, mode, silent)
     if not ctx then return end
     if not self:isConfigured() then
-        if not silent then self:notify(_("Set the server, username and password first (Tools → CrossPoint Sync → Account & server).")) end
+        if not silent then self:notify(_("Set the server, username and password first (Tools → CrossPoint Sync → Settings → Account & server).")) end
         return
     end
     local ids = self:idsFor(ctx)
@@ -1480,6 +1482,1069 @@ function CrossPointSync:syncAllAnnotations()
     end)
 end
 
+local function tzOffsetMinutes()
+    local now = os.time()
+    local utc = os.date("!*t", now)
+    utc.isdst = os.date("*t", now).isdst
+    return math.floor(os.difftime(os.time(utc), now) / 60 + 0.5)
+end
+
+local function groupThousands(n)
+    local str = tostring(math.floor(tonumber(n) or 0))
+    local out = str:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (out:gsub("^,", ""))
+end
+
+local function formatDuration(seconds)
+    seconds = tonumber(seconds) or 0
+    if seconds >= 3600 then return T(_("%1h"), math.floor(seconds / 3600)) end
+    return T(_("%1m"), math.floor(seconds / 60))
+end
+
+local function timeAgo(ts)
+    ts = tonumber(ts)
+    if not ts then return "" end
+    local d = os.time() - ts
+    if d < 3600 then return T(_("%1m ago"), math.max(1, math.floor(d / 60))) end
+    if d < 86400 then return T(_("%1h ago"), math.floor(d / 3600)) end
+    if d < 30 * 86400 then return T(_("%1d ago"), math.floor(d / 86400)) end
+    return os.date("%d %b %Y", ts)
+end
+
+function CrossPointSync:fetchLibrary()
+    local items, cursor = {}, nil
+    for _page = 1, 20 do
+        local path = "/api/v1/progress?limit=500" .. (cursor and ("&cursor=" .. util.urlEncode(cursor)) or "")
+        local code, data, err = self:request("GET", path)
+        if not httpOk(code) or type(data) ~= "table" then return nil, reqError(code, data, err) end
+        for _i, it in ipairs(data.items or {}) do items[#items + 1] = it end
+        cursor = data.next
+        if type(cursor) ~= "string" or cursor == "" then break end
+    end
+    local index
+    local books = {}
+    for _i, it in ipairs(items) do
+        local title = type(it.title) == "string" and it.title ~= "" and it.title
+            or type(it.filename) == "string" and it.filename ~= "" and it.filename:gsub("%.[^.]*$", "")
+        if not title then
+            index = index or self:localBookIndex()
+            local f = index[it.document]
+            if f then
+                it._file = f
+                title = basename(f):gsub("%.[^.]*$", "")
+            else
+                title = T(_("Unknown book (%1)"), tostring(it.document):sub(1, 8))
+            end
+        end
+        it._title = title
+        it._author = type(it.author) == "string" and it.author or ""
+        it._named = (type(it.title) == "string" and it.title ~= "") or (type(it.filename) == "string" and it.filename ~= "")
+        books[#books + 1] = it
+    end
+    books._items = items
+    return books
+end
+
+function CrossPointSync:localBookIndex()
+    local ReadHistory = require("readhistory")
+    local index = {}
+    for _i, item in ipairs(ReadHistory.hist or {}) do
+        local f = item.file
+        if f and lfs.attributes(f, "mode") == "file" then
+            local h = self:hashesFor(f)
+            index[h.filename] = index[h.filename] or f
+            if h.binary then index[h.binary] = index[h.binary] or f end
+        end
+    end
+    return index
+end
+
+function CrossPointSync:findLocalBook(book)
+    if book._file then return book._file end
+    local ReadHistory = require("readhistory")
+    for _i, item in ipairs(ReadHistory.hist or {}) do
+        local f = item.file
+        if f and lfs.attributes(f, "mode") == "file" then
+            local name = basename(f)
+            if (type(book.filename) == "string" and name == book.filename) or sha2.md5(name) == book.document then
+                return f
+            end
+        end
+    end
+end
+
+function CrossPointSync:editReadingDates(document, title, started_at, finished_at, on_saved)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local DateTimeWidget = require("ui/widget/datetimewidget")
+    local function key(t) return t and os.date("%Y-%m-%d", t) or nil end
+    local orig = { start = key(tonumber(started_at)), finish = key(tonumber(finished_at)) }
+    local cur = { start = orig.start, finish = orig.finish }
+    local dialog
+    local function label(k) return k and os.date("%d %b %Y", os.time{ year = tonumber(k:sub(1, 4)), month = tonumber(k:sub(6, 7)), day = tonumber(k:sub(9, 10)), hour = 12 }) or _("not set") end
+    local show
+    local function pick(which)
+        local base = cur[which] or os.date("%Y-%m-%d")
+        UIManager:close(dialog)
+        UIManager:show(DateTimeWidget:new{
+            year = tonumber(base:sub(1, 4)),
+            month = tonumber(base:sub(6, 7)),
+            day = tonumber(base:sub(9, 10)),
+            ok_text = _("Set"),
+            title_text = which == "start" and _("Started") or _("Finished"),
+            callback = function(t)
+                cur[which] = string.format("%04d-%02d-%02d", t.year, t.month, t.day)
+                show()
+            end,
+            cancel_callback = function() show() end,
+        })
+    end
+    local function save()
+        if cur.start and cur.finish and cur.start > cur.finish then
+            self:notify(_("The start date is after the finish date."))
+            return
+        end
+        local parts = {}
+        for _i, f in ipairs{ { "start", "start_date" }, { "finish", "finished_date" } } do
+            if cur[f[1]] ~= orig[f[1]] then
+                parts[#parts + 1] = string.format('"%s":%s', f[2], cur[f[1]] and ('"' .. cur[f[1]] .. '"') or "null")
+            end
+        end
+        UIManager:close(dialog)
+        if #parts == 0 then return end
+        self:onlineOrAsk(function()
+            local code, data, err = self:request("PUT", "/api/v1/documents/" .. document .. "/dates", "{" .. table.concat(parts, ",") .. "}")
+            if not httpOk(code) then
+                self:notify(T(_("Could not save the dates: %1"), reqError(code, data, err)))
+                return
+            end
+            self:notify(_("Reading dates saved."))
+            if on_saved then on_saved() end
+        end)
+    end
+    show = function()
+        dialog = ButtonDialog:new{
+            title = T(_("Reading dates · %1\n\nDates you set here win over your reader's. Setting a finish date marks the book finished."), title),
+            title_align = "left",
+            buttons = {
+                {
+                    { text = T(_("Started: %1"), label(cur.start)), callback = function() pick("start") end },
+                    { text = _("Clear"), enabled = cur.start ~= nil, callback = function() cur.start = nil; UIManager:close(dialog); show() end },
+                },
+                {
+                    { text = T(_("Finished: %1"), label(cur.finish)), callback = function() pick("finish") end },
+                    { text = _("Clear"), enabled = cur.finish ~= nil, callback = function() cur.finish = nil; UIManager:close(dialog); show() end },
+                },
+                {
+                    { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+                    { text = _("Save"), callback = save },
+                },
+            },
+        }
+        UIManager:show(dialog)
+    end
+    show()
+end
+
+function CrossPointSync:showMenuPage(title, items, on_closed)
+    local Blitbuffer = require("ffi/blitbuffer")
+    local FrameContainer = require("ui/widget/container/framecontainer")
+    local Geom = require("ui/geometry")
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local Menu = require("ui/widget/menu")
+    local sw, sh = Device.screen:getWidth(), Device.screen:getHeight()
+    local page = InputContainer:new{
+        covers_fullscreen = true,
+        dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+    }
+    local menu = Menu:new{
+        title = title,
+        item_table = items,
+        width = sw,
+        height = sh,
+        is_borderless = true,
+        is_popout = false,
+        title_bar_fm_style = true,
+        show_parent = page,
+        onClose = function()
+            UIManager:close(page)
+            UIManager:setDirty("all", "ui")
+            if on_closed then on_closed(page) end
+            return true
+        end,
+    }
+    page[1] = FrameContainer:new{
+        width = sw,
+        height = sh,
+        padding = 0,
+        bordersize = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        menu,
+    }
+    UIManager:show(page)
+    return page
+end
+
+local function normTitle(s)
+    return (tostring(s or ""):lower():gsub("[%s%p]+", ""))
+end
+
+function CrossPointSync:showBookDetails(book, close_all, all_books)
+    local TextViewer = require("ui/widget/textviewer")
+    local lines = { book._title }
+    if book._author ~= "" then lines[#lines + 1] = book._author end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = T(_("Status: %1"), STATUS_LABELS[book.status] or book.status or "-")
+    lines[#lines + 1] = T(_("Progress: %1"), formatPercent(tonumber(book.percentage) or 0))
+    if tonumber(book.page_count) then lines[#lines + 1] = T(_("Pages: %1"), book.page_count) end
+    if type(book.series) == "string" and book.series ~= "" then
+        lines[#lines + 1] = T(_("Series: %1"), book.series .. (book.series_position and (" #" .. tostring(book.series_position)) or ""))
+    end
+    if tonumber(book.rating) then lines[#lines + 1] = T(_("Rating: %1"), book.rating) end
+    if tonumber(book.release_year) then lines[#lines + 1] = T(_("Released: %1"), book.release_year) end
+    if type(book.genres) == "table" and #book.genres > 0 then
+        lines[#lines + 1] = T(_("Genres: %1"), table.concat(book.genres, ", "))
+    end
+    local d = book._dates or {}
+    if tonumber(d.started_at) then lines[#lines + 1] = T(_("Started: %1"), os.date("%d %b %Y", tonumber(d.started_at))) end
+    if tonumber(d.finished_at) then lines[#lines + 1] = T(_("Finished: %1"), os.date("%d %b %Y", tonumber(d.finished_at))) end
+    lines[#lines + 1] = T(_("Last sync: %1 (%2)"), timeAgo(book.timestamp), book.device or "?")
+    if type(book.filename) == "string" then lines[#lines + 1] = T(_("File: %1"), book.filename) end
+    if not book._named then lines[#lines + 1] = _("No title or file name on the server.") end
+    local aliases = type(book.aliases) == "table" and book.aliases or {}
+    if #aliases > 0 then lines[#lines + 1] = T(_("Merged copies: %1"), #aliases) end
+
+    local file = self:findLocalBook(book)
+    local viewer, picker
+    local function finish(message)
+        if picker then UIManager:close(picker) end
+        if viewer then UIManager:close(viewer) end
+        if close_all then close_all() end
+        UIManager:setDirty("all", "ui")
+        if message then self:notify(message) end
+        self:showLibrary()
+    end
+    local function serverAction(calls, done_message, fail_message)
+        self:onlineOrAsk(function()
+            for _i, c in ipairs(calls) do
+                local code, data, err = self:request(c[1], c[2], c[3])
+                if not httpOk(code) and not (c[4] and code == 404) then
+                    self:notify(T(fail_message, reqError(code, data, err)))
+                    return
+                end
+            end
+            finish(done_message)
+        end)
+    end
+
+    local function mergePicker()
+        local likely, rest = {}, {}
+        local key = normTitle(book._title)
+        for _i, b in ipairs(all_books or {}) do
+            if b.document ~= book.document then
+                local other = normTitle(b._title)
+                local same = other == key
+                    or (math.min(#other, #key) >= 6 and (other:find(key, 1, true) or key:find(other, 1, true)))
+                if same or not b._named then likely[#likely + 1] = b else rest[#rest + 1] = b end
+            end
+        end
+        table.sort(likely, function(a, b)
+            if a._named ~= b._named then return a._named == true end
+            return (tonumber(a.timestamp) or 0) > (tonumber(b.timestamp) or 0)
+        end)
+        table.sort(rest, function(a, b) return a._title:lower() < b._title:lower() end)
+        local items = {}
+        local function add(b)
+            items[#items + 1] = {
+                text = b._author ~= "" and (b._title .. " · " .. b._author) or b._title,
+                mandatory = (b._named and "" or (_("No metadata") .. " · ")) .. formatPercent(tonumber(b.percentage) or 0),
+                callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("Merge \"%1\" into \"%2\"?\n\nThe farthest-along reading position from either copy is kept. Highlights, bookmarks and reading stats are combined. Future syncs from either copy update this book."), b._title, book._title),
+                        ok_text = _("Merge"),
+                        ok_callback = function()
+                            serverAction({
+                                { "POST", "/api/v1/documents/merge", { document = b.document, into = book.document, stats = true } },
+                            }, T(_("Merged \"%1\" into \"%2\"."), b._title, book._title), _("Could not merge: %1"))
+                        end,
+                    })
+                end,
+            }
+        end
+        for _i, b in ipairs(likely) do add(b) end
+        if #likely > 0 and #rest > 0 then items[#items].separator = true end
+        for _i, b in ipairs(rest) do add(b) end
+        if #items == 0 then items[1] = { text = _("No other books"), select_enabled = false } end
+        picker = self:showMenuPage(T(_("Merge into \"%1\""), book._title), items, function() picker = nil end)
+    end
+
+    local action_row = {
+        { text = _("Merge a duplicate"), callback = mergePicker },
+    }
+    local dates = book._dates or {}
+    local dates_row = {
+        {
+            text = _("Reading dates"),
+            callback = function()
+                self:editReadingDates(book.document, book._title, dates.started_at, dates.finished_at, function() finish() end)
+            end,
+        },
+    }
+    if #aliases > 0 then
+        action_row[#action_row + 1] = {
+            text = #aliases == 1 and _("Separate merged copy") or T(_("Separate %1 merged copies"), #aliases),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = _("Separate the merged copies from this book?\n\nFuture syncs from the separated copies will show as their own books."),
+                    ok_text = _("Separate"),
+                    ok_callback = function()
+                        local calls = {}
+                        for _i, alias in ipairs(aliases) do
+                            calls[#calls + 1] = { "DELETE", "/api/v1/documents/merge/" .. alias, nil, true }
+                        end
+                        serverAction(calls, _("Merged copies separated."), _("Could not separate: %1"))
+                    end,
+                })
+            end,
+        }
+    end
+    local buttons = {
+        dates_row,
+        action_row,
+        {
+            {
+                text = _("Remove from library"),
+                callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("Remove \"%1\" from your CrossPoint library?\n\nThis deletes its progress, highlights, bookmarks and reading stats on the server for all devices. It cannot be undone."), book._title),
+                        ok_text = _("Remove"),
+                        ok_callback = function()
+                            serverAction({ { "DELETE", "/api/v1/progress/" .. book.document, nil, true } },
+                                T(_("Removed \"%1\" from your CrossPoint library."), book._title), _("Could not remove the book: %1"))
+                        end,
+                    })
+                end,
+            },
+        },
+        {
+            {
+                text = _("Open on this device"),
+                enabled = file ~= nil,
+                callback = function()
+                    UIManager:close(viewer)
+                    if close_all then close_all() end
+                    UIManager:setDirty("all", "ui")
+                    require("apps/reader/readerui"):showReader(file)
+                end,
+            },
+            { text = _("Close"), callback = function() viewer:onClose() end },
+        },
+    }
+    viewer = TextViewer:new{
+        title = _("CrossPoint"),
+        text = table.concat(lines, "\n"),
+        buttons_table = buttons,
+        add_default_buttons = false,
+        close_callback = function() UIManager:setDirty("all", "ui") end,
+    }
+    UIManager:show(viewer)
+end
+
+function CrossPointSync:previewStartFix(books, titles, all)
+    local sum_all, n_all, sum_rows = 0, 0, 0
+    for _i, b in ipairs(all or {}) do
+        sum_all = sum_all + (tonumber(b.days_to_finish) or 0)
+        n_all = n_all + 1
+    end
+    for _i, b in ipairs(books) do sum_rows = sum_rows + (tonumber(b.days_to_finish) or 0) end
+    local avg_now = n_all > 0 and math.floor(sum_all / n_all + 0.5) or 0
+    local avg_new = n_all > 0 and math.floor((sum_all - sum_rows + #books) / n_all + 0.5) or 0
+    local items = {
+        {
+            text = T(_("Days per book: %1 now, %2 after"), avg_now, avg_new),
+            select_enabled = false,
+            bold = true,
+            separator = true,
+        },
+    }
+    for _i, b in ipairs(books) do
+        local book = titles[b.document]
+        local title = book and (book._author ~= "" and (book._title .. " · " .. book._author) or book._title) or b.document
+        local started, finished = tonumber(b.started_at), tonumber(b.finished_at)
+        items[#items + 1] = {
+            text = title,
+            mandatory = T(_("%1 → 1 day"), b.days_to_finish),
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = T(_("%1\n\nNow: %2 – %3 (%4 days)\nAfter: %3 – %3 (1 day)"), title,
+                        started and os.date("%d %b %Y", started) or "-",
+                        finished and os.date("%d %b %Y", finished) or "-",
+                        b.days_to_finish),
+                })
+            end,
+        }
+    end
+    items[#items].separator = true
+    items[#items + 1] = {
+        text = T(_("Set start = finish date for these %1 books"), #books),
+        bold = true,
+        callback = function()
+            UIManager:show(ConfirmBox:new{
+                text = T(_("Set the start date of %1 books to their finish date on the server?\n\nEach then counts as read in 1 day. Finish dates and status stay as they are. You can change any of them later with Reading dates on the website."), #books),
+                ok_text = _("Set dates"),
+                ok_callback = function()
+                    self:onlineOrAsk(function()
+                        local failed = 0
+                        for _i, b in ipairs(books) do
+                            local finished = tonumber(b.finished_at)
+                            local code
+                            if finished then
+                                code = self:request("PUT", "/api/v1/documents/" .. b.document .. "/dates",
+                                    { start_date = os.date("%Y-%m-%d", finished) })
+                            end
+                            if not httpOk(code) then failed = failed + 1 end
+                        end
+                        self:notify(failed == 0 and T(_("Updated %1 start dates."), #books)
+                            or T(_("Updated %1 start dates, %2 failed."), #books - failed, failed))
+                    end)
+                end,
+            })
+        end,
+    }
+    self:showMenuPage(T(_("Preview (%1 books)"), #books), items)
+end
+
+function CrossPointSync:showLibrary()
+    self:onlineOrAsk(function()
+        local books, err = self:fetchLibrary()
+        if not books then
+            self:notify(T(_("Could not load the library: %1"), tostring(err)))
+            return
+        end
+        local scode, summary = self:request("GET", "/api/v1/stats/summary")
+        if not httpOk(scode) or type(summary) ~= "table" then summary = nil end
+        local acode, activity = self:request("GET", "/api/v1/stats/activity?tz=" .. tzOffsetMinutes())
+        if not httpOk(acode) or type(activity) ~= "table" then activity = nil end
+
+        local groups = { reading = {}, paused = {}, finished = {}, dnf = {}, untitled = {} }
+        for _i, b in ipairs(books) do
+            local g = b._named and (groups[b.status] or groups.reading) or groups.untitled
+            g[#g + 1] = b
+        end
+        local function ts(b) return tonumber(b.status_at) or tonumber(b.timestamp) or 0 end
+        for _k, g in pairs(groups) do table.sort(g, function(a, b) return ts(a) > ts(b) end) end
+
+        local view, list_menu
+        local function closeAll()
+            if list_menu then UIManager:close(list_menu) end
+            if view then UIManager:close(view) end
+        end
+        local function showList(key)
+            local out = {}
+            for _i, b in ipairs(groups[key]) do
+                out[#out + 1] = {
+                    text = b._author ~= "" and (b._title .. " · " .. b._author) or b._title,
+                    mandatory = key == "finished" and os.date("%d %b %Y", ts(b))
+                        or key == "untitled" and ((STATUS_LABELS[b.status] or STATUS_LABELS.reading) .. " · " .. formatPercent(tonumber(b.percentage) or 0))
+                        or formatPercent(tonumber(b.percentage) or 0),
+                    callback = function() self:showBookDetails(b, closeAll, books) end,
+                }
+            end
+            if #out == 0 then out[1] = { text = _("No books"), select_enabled = false } end
+            list_menu = self:showMenuPage(
+                T(_("%1 (%2)"), key == "untitled" and _("No metadata") or STATUS_LABELS[key], #groups[key]),
+                out,
+                function(page) if list_menu == page then list_menu = nil end end)
+        end
+
+        local dates_by_doc = {}
+        for _i, b in ipairs(activity and activity.books or {}) do dates_by_doc[b.document] = b end
+        for _i, b in ipairs(books) do b._dates = dates_by_doc[b.document] end
+        local stats
+        if summary or activity then
+            local ok, res = pcall(function() return self:libraryStats(books, books._items or {}, summary, activity) end)
+            if ok then stats = res else logger.warn("CrossPointSync: stats failed", res) end
+        end
+        local more_view, longest_page
+        local function reloadAll()
+            if longest_page then UIManager:close(longest_page) end
+            if more_view then UIManager:close(more_view) end
+            closeAll()
+            UIManager:setDirty("all", "ui")
+            self:showLibrary()
+        end
+        local function showMore()
+            local titles = {}
+            for _i, b in ipairs(books) do titles[b.document] = b end
+            more_view = self:moreStatsView(stats, self:getSetting("dev_mode", false) and function()
+                local list = {}
+                for _i, b in ipairs(stats.longest or {}) do list[#list + 1] = b end
+                table.sort(list, function(a, b) return tonumber(a.days_to_finish) > tonumber(b.days_to_finish) end)
+                local out = {}
+                for _i, b in ipairs(list) do
+                    local book = titles[b.document]
+                    local title = book and (book._author ~= "" and (book._title .. " · " .. book._author) or book._title) or b.document
+                    local started, finished = tonumber(b.started_at), tonumber(b.finished_at)
+                    out[#out + 1] = {
+                        text = title,
+                        mandatory = T(_("%1 days"), b.days_to_finish),
+                        callback = function()
+                            local ButtonDialog = require("ui/widget/buttondialog")
+                            local info
+                            info = ButtonDialog:new{
+                                title = T(_("%1\n\nStarted: %2\nFinished: %3\n%4 days"), title,
+                                    started and os.date("%d %b %Y", started) or "-",
+                                    finished and os.date("%d %b %Y", finished) or "-",
+                                    b.days_to_finish),
+                                title_align = "left",
+                                buttons = {
+                                    {
+                                        { text = _("Close"), callback = function() UIManager:close(info) end },
+                                        {
+                                            text = _("Reading dates"),
+                                            callback = function()
+                                                UIManager:close(info)
+                                                self:editReadingDates(b.document, book and book._title or title, b.started_at, b.finished_at, reloadAll)
+                                            end,
+                                        },
+                                    },
+                                },
+                            }
+                            UIManager:show(info)
+                        end,
+                    }
+                end
+                if #out == 0 then out[1] = { text = _("No books"), select_enabled = false } end
+                local placeholders = {}
+                for _i, b in ipairs(list) do
+                    local started = tonumber(b.started_at)
+                    if started and (os.date("%m-%d", started) == "01-01" or os.date("!%m-%d", started) == "01-01")
+                            and (tonumber(b.days_to_finish) or 0) >= 60 then
+                        placeholders[#placeholders + 1] = b
+                    end
+                end
+                if #placeholders > 0 then
+                    table.insert(out, 1, {
+                        text = T(_("Preview: books starting 1 January (%1)"), #placeholders),
+                        bold = true,
+                        separator = true,
+                        callback = function()
+                            self:previewStartFix(placeholders, titles, list)
+                        end,
+                    })
+                end
+                longest_page = self:showMenuPage(T(_("Longest to finish (%1)"), #list), out)
+            end or nil)
+            UIManager:show(more_view)
+        end
+        view = self:libraryView(groups, stats, showList, showMore)
+        UIManager:show(view)
+    end)
+end
+
+local DAY = 86400
+
+local function dayKey(t) return os.date("%Y-%m-%d", t) end
+
+local function keyTime(key)
+    local y, m, d = tostring(key):match("^(%d+)-(%d+)-(%d+)$")
+    if not y then return nil end
+    return os.time{ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 }
+end
+
+local function todayNoon()
+    local t = os.date("*t")
+    return os.time{ year = t.year, month = t.month, day = t.day, hour = 12 }
+end
+
+local function formatHM(seconds)
+    seconds = math.floor(tonumber(seconds) or 0)
+    local h, m = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60)
+    if h > 0 then return T(_("%1h %2m"), h, m) end
+    return T(_("%1m"), m)
+end
+
+local function shadeLevels(map, fallback)
+    local cutoff = dayKey(os.time() - 90 * DAY)
+    local values = {}
+    for key, v in pairs(map) do
+        if key > cutoff and type(v) == "number" and v > 0 then values[#values + 1] = v end
+    end
+    table.sort(values)
+    local n = #values
+    local median = 0
+    if n > 0 then
+        median = n % 2 == 1 and values[(n + 1) / 2] or (values[n / 2] + values[n / 2 + 1]) / 2
+    end
+    local baseline = (14 * fallback + n * median) / (14 + n)
+    return function(amount)
+        if amount == nil then return 2 end
+        local r = amount / baseline
+        return r < 0.5 and 1 or r < 1.25 and 2 or r < 2 and 3 or 4
+    end
+end
+
+function CrossPointSync:libraryStats(books, items, summary, activity)
+    summary = type(summary) == "table" and summary or {}
+    activity = type(activity) == "table" and activity or {}
+    local known_docs = {}
+    for _i, it in ipairs(items) do
+        if (type(it.title) == "string" and it.title ~= "") or (type(it.filename) == "string" and it.filename ~= "") then
+            known_docs[it.document] = true
+        end
+    end
+
+    local shown = {}
+    for _i, b in ipairs(activity.books or {}) do
+        if known_docs[b.document] then shown[#shown + 1] = b end
+    end
+    local year = os.date("%Y")
+    local pages_total, finished, finished_year, page_sum, page_known, spans = 0, 0, 0, 0, 0, {}
+    local longest_list = {}
+    for _i, b in ipairs(shown) do
+        pages_total = pages_total + (tonumber(b.pages_read) or 0)
+        if b.completed or tonumber(b.finished_at) then
+            finished = finished + 1
+            if tonumber(b.finished_at) and os.date("%Y", tonumber(b.finished_at)) == year then
+                finished_year = finished_year + 1
+            end
+            if tonumber(b.days_to_finish) and tonumber(b.days_to_finish) > 0 then
+                spans[#spans + 1] = tonumber(b.days_to_finish)
+                longest_list[#longest_list + 1] = b
+            end
+        end
+        if tonumber(b.page_count) and tonumber(b.page_count) > 0 then
+            page_sum = page_sum + tonumber(b.page_count)
+            page_known = page_known + 1
+        end
+    end
+    local span_sum = 0
+    for _i, v in ipairs(spans) do span_sum = span_sum + v end
+    local reading_now, finished_status = 0, 0
+    for _i, b in ipairs(books) do
+        if b._named then
+            if b.status == "reading" then reading_now = reading_now + 1 end
+            if b.status == "finished" then finished_status = finished_status + 1 end
+        end
+    end
+
+    local read = {}
+    local bytes = summary.history_b64 and mime.unb64(summary.history_b64) or ""
+    local anchor = tonumber(summary.anchor_day)
+    if anchor and anchor > 0 and bytes and #bytes > 0 then
+        local base = 946684800 + anchor * DAY + 12 * 3600
+        for n = 0, #bytes * 8 - 1 do
+            local byte = bytes:byte(math.floor(n / 8) + 1)
+            if math.floor(byte / 2 ^ (n % 8)) % 2 == 1 then
+                read[os.date("!%Y-%m-%d", base - n * DAY)] = true
+            end
+        end
+    end
+    for _i, day in ipairs(activity.reading_days or {}) do read[day] = true end
+
+    local today = todayNoon()
+    local today_key = dayKey(today)
+    local t = read[today_key] and today or today - DAY
+    local streak = 0
+    while read[dayKey(t)] do
+        streak = streak + 1
+        t = t - DAY
+    end
+    local keys = {}
+    for key in pairs(read) do if key <= today_key then keys[#keys + 1] = key end end
+    table.sort(keys)
+    local longest, run, prev = 0, 0, nil
+    for _i, key in ipairs(keys) do
+        local kt = keyTime(key)
+        run = (prev and kt and math.floor((kt - prev) / DAY + 0.5) == 1) and run + 1 or 1
+        if run > longest then longest = run end
+        prev = kt
+    end
+
+    local pages_by_day = {}
+    for _i, d in ipairs(activity.days or {}) do
+        if (tonumber(d.syncs) or 0) > 0 or (tonumber(d.pages) or 0) > 0 then
+            pages_by_day[d.day] = tonumber(d.pages) or 0
+        end
+    end
+    local time_by_day = {}
+    local daily = {}
+    for _i, d in ipairs(summary.daily or {}) do daily[d.date] = tonumber(d.seconds) end
+    for key in pairs(read) do time_by_day[key] = daily[key] or false end
+    for key, s in pairs(daily) do if s and s > 0 then time_by_day[key] = s end end
+    local page_level = shadeLevels(pages_by_day, 20)
+    local plain_time = {}
+    for key, s in pairs(time_by_day) do if s then plain_time[key] = s end end
+    local time_level = shadeLevels(plain_time, 30 * 60)
+    local function level(key)
+        local p, s = pages_by_day[key], time_by_day[key]
+        if p == nil and s == nil then return 0 end
+        if p and p > 0 then return page_level(p) end
+        if s then return time_level(s) end
+        return 2
+    end
+
+    local monday = today - ((tonumber(os.date("%w", today)) + 6) % 7) * DAY
+    local weekly = {}
+    for i = 1, 12 do
+        local start = monday - (12 - i) * 7 * DAY
+        local pages = 0
+        for d = 0, 6 do pages = pages + (pages_by_day[dayKey(start + d * DAY)] or 0) end
+        weekly[i] = { start = start, pages = math.floor(pages + 0.5) }
+    end
+
+    local cal_first = monday - 52 * 7 * DAY
+    local cal_days = 0
+    for d = 0, 52 * 7 + 6 do
+        local dt = cal_first + d * DAY
+        if dt <= today and level(dayKey(dt)) > 0 then cal_days = cal_days + 1 end
+    end
+
+    local tod, dow = {}, {}
+    for i = 1, 4 do tod[i] = tonumber((summary.tod or {})[i]) or 0 end
+    for i = 1, 7 do dow[i] = tonumber((summary.dow or {})[i]) or 0 end
+
+    return {
+        pages = {
+            { groupThousands(pages_total), _("Pages read") },
+            { groupThousands(finished), _("Books finished") },
+            { groupThousands(reading_now), _("Reading now") },
+            { groupThousands(finished_year), _("Finished this year") },
+            { page_known > 0 and groupThousands(page_sum / page_known + 0.5) or "-", _("Pages per book") },
+            { #spans > 0 and groupThousands(span_sum / #spans + 0.5) or "-", _("Days per book") },
+        },
+        time = {
+            { T(_("%1 days"), streak), _("Current streak") },
+            { T(_("%1 days"), longest), _("Longest streak") },
+            { formatHM(summary.seconds), _("Time read") },
+            { groupThousands(summary.pages), _("Pages turned") },
+            { groupThousands(summary.sessions), _("Sessions") },
+            { groupThousands(finished_status), _("Books finished") },
+        },
+        weekly = weekly,
+        longest = longest_list,
+        calendar = { first = cal_first, today = today, level = level, days = cal_days },
+        tod = tod,
+        dow = dow,
+    }
+end
+
+local function uiKit()
+    return {
+        Blitbuffer = require("ffi/blitbuffer"),
+        ButtonTable = require("ui/widget/buttontable"),
+        CenterContainer = require("ui/widget/container/centercontainer"),
+        Font = require("ui/font"),
+        FrameContainer = require("ui/widget/container/framecontainer"),
+        Geom = require("ui/geometry"),
+        HorizontalGroup = require("ui/widget/horizontalgroup"),
+        HorizontalSpan = require("ui/widget/horizontalspan"),
+        InputContainer = require("ui/widget/container/inputcontainer"),
+        LeftContainer = require("ui/widget/container/leftcontainer"),
+        LineWidget = require("ui/widget/linewidget"),
+        OverlapGroup = require("ui/widget/overlapgroup"),
+        RightContainer = require("ui/widget/container/rightcontainer"),
+        Size = require("ui/size"),
+        TextWidget = require("ui/widget/textwidget"),
+        TitleBar = require("ui/widget/titlebar"),
+        VerticalGroup = require("ui/widget/verticalgroup"),
+        VerticalSpan = require("ui/widget/verticalspan"),
+    }
+end
+
+local function fullscreenPage(K, title, build)
+    local Screen = Device.screen
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local view = K.InputContainer:new{ covers_fullscreen = true }
+    if Device:hasKeys() then
+        view.key_events.Close = { { Device.input.group.Back } }
+    end
+    function view:onClose()
+        UIManager:close(self)
+        UIManager:setDirty("all", "ui")
+        return true
+    end
+    local title_bar = K.TitleBar:new{
+        width = sw,
+        title = title,
+        with_bottom_line = true,
+        close_callback = function() view:onClose() end,
+        show_parent = view,
+    }
+    local content = K.VerticalGroup:new{ align = "center", title_bar }
+    build(content, view, sw, sh - title_bar:getSize().h)
+    view[1] = K.FrameContainer:new{
+        width = sw,
+        height = sh,
+        padding = 0,
+        bordersize = 0,
+        background = K.Blitbuffer.COLOR_WHITE,
+        content,
+    }
+    view.dimen = K.Geom:new{ x = 0, y = 0, w = sw, h = sh }
+    return view
+end
+
+local function sectionHeader(K, text, width)
+    return K.LeftContainer:new{
+        dimen = K.Geom:new{ w = width, h = K.Font:getFace("tfont", 18).size * 1.6 },
+        K.TextWidget:new{ text = text, face = K.Font:getFace("tfont", 18), bold = true },
+    }
+end
+
+local function tileGrid(K, tiles, width, tile_h)
+    local Screen = Device.screen
+    local cols, gap = 3, Screen:scaleBySize(8)
+    local tile_w = math.floor((width - (cols - 1) * gap) / cols)
+    local value_face = K.Font:getFace("cfont", 22)
+    local label_face = K.Font:getFace("xx_smallinfofont")
+    local border = K.Size.border.thin
+    local text_w = tile_w - 2 * (K.Size.padding.default + border)
+    local grid = K.VerticalGroup:new{ align = "left" }
+    for r = 1, math.ceil(#tiles / cols) do
+        local row = K.HorizontalGroup:new{ align = "top" }
+        for c = 1, cols do
+            local t = tiles[(r - 1) * cols + c]
+            if c > 1 then row[#row + 1] = K.HorizontalSpan:new{ width = gap } end
+            if t then
+                row[#row + 1] = K.FrameContainer:new{
+                    bordersize = border,
+                    radius = K.Size.radius.window,
+                    padding = 0,
+                    background = K.Blitbuffer.COLOR_WHITE,
+                    K.CenterContainer:new{
+                        dimen = K.Geom:new{ w = tile_w - 2 * border, h = tile_h - 2 * border },
+                        K.VerticalGroup:new{
+                            align = "center",
+                            K.TextWidget:new{ text = t[1], face = value_face, bold = true, max_width = text_w },
+                            K.TextWidget:new{ text = t[2], face = label_face, max_width = text_w,
+                                fgcolor = K.Blitbuffer.COLOR_DARK_GRAY },
+                        },
+                    },
+                }
+            else
+                row[#row + 1] = K.HorizontalSpan:new{ width = tile_w }
+            end
+        end
+        if r > 1 then grid[#grid + 1] = K.VerticalSpan:new{ width = gap } end
+        grid[#grid + 1] = row
+    end
+    return grid
+end
+
+function CrossPointSync:libraryView(groups, stats, on_status, on_more)
+    local K = uiKit()
+    local Screen = Device.screen
+    return fullscreenPage(K, _("CrossPoint Library"), function(content, view, sw, avail)
+        local pad = K.Size.padding.large
+        local gap = Screen:scaleBySize(8)
+        local section_gap = Screen:scaleBySize(24)
+        local inner_w = sw - 2 * pad
+
+        local function statusButton(key)
+            return {
+                text = T(_("%1  %2"), STATUS_LABELS[key], #groups[key]),
+                callback = function() on_status(key) end,
+            }
+        end
+        local rows = {
+            { statusButton("reading"), statusButton("paused") },
+            { statusButton("finished"), statusButton("dnf") },
+        }
+        local last = {}
+        if #groups.untitled > 0 then
+            last[#last + 1] = {
+                text = T(_("No metadata  %1"), #groups.untitled),
+                callback = function() on_status("untitled") end,
+            }
+        end
+        if stats then last[#last + 1] = { text = _("More stats"), callback = on_more } end
+        if #last > 0 then rows[#rows + 1] = last end
+        local buttons = K.ButtonTable:new{ width = inner_w, buttons = rows, zero_sep = true, show_parent = view }
+
+        if stats then
+            local header_h = sectionHeader(K, "x", inner_w):getSize().h
+            local used = 2 * header_h + buttons:getSize().h + section_gap * 2 + pad * 2 + 2 * gap
+            local tile_w = math.floor((inner_w - 2 * gap) / 3)
+            local tile_h = math.max(Screen:scaleBySize(50), math.min(math.floor(tile_w * 0.5), math.floor((avail - used) / 4)))
+            content[#content + 1] = K.VerticalSpan:new{ width = pad }
+            content[#content + 1] = sectionHeader(K, _("Pages & books"), inner_w)
+            content[#content + 1] = tileGrid(K, stats.pages, inner_w, tile_h)
+            content[#content + 1] = K.VerticalSpan:new{ width = section_gap }
+            content[#content + 1] = sectionHeader(K, _("Reading time"), inner_w)
+            content[#content + 1] = tileGrid(K, stats.time, inner_w, tile_h)
+            content[#content + 1] = K.VerticalSpan:new{ width = section_gap }
+        else
+            content[#content + 1] = K.VerticalSpan:new{ width = pad }
+        end
+        content[#content + 1] = buttons
+        content[#content + 1] = K.LineWidget:new{
+            background = K.Blitbuffer.COLOR_GRAY,
+            dimen = K.Geom:new{ w = inner_w, h = K.Size.line.medium },
+        }
+    end)
+end
+
+local SHADES = { 0xE6, 0xBB, 0x8C, 0x5A, 0x22 }
+
+function CrossPointSync:moreStatsView(stats, on_longest)
+    local K = uiKit()
+    local Screen = Device.screen
+    return fullscreenPage(K, _("More stats"), function(content, view, sw, avail)
+        local pad = K.Size.padding.large
+        local inner_w = sw - 2 * pad
+        local small = K.Font:getFace("xx_smallinfofont")
+        local tiny = K.Font:getFace("infont", 12)
+        local gray = K.Blitbuffer.COLOR_DARK_GRAY
+        local section_gap = Screen:scaleBySize(14)
+        local function shade(v) return K.Blitbuffer.Color8(v) end
+        local function box(w, h, v)
+            return K.LineWidget:new{ dimen = K.Geom:new{ w = math.max(0, math.floor(w)), h = math.max(0, math.floor(h)) }, background = shade(v) }
+        end
+        local header_h = sectionHeader(K, "x", inner_w):getSize().h
+        local text_h = K.TextWidget:new{ text = "0", face = small }:getSize().h
+        local tiny_h = K.TextWidget:new{ text = "0", face = tiny }:getSize().h
+
+        local cal_gap = math.max(1, Screen:scaleBySize(2))
+        local label_w = K.TextWidget:new{ text = "M", face = tiny }:getSize().w + Screen:scaleBySize(6)
+        local cell = math.floor((inner_w - label_w - 52 * cal_gap) / 53)
+        local cal_h = 7 * cell + 6 * cal_gap + tiny_h + tiny_h
+        local bar_row_h = math.max(text_h, Screen:scaleBySize(20))
+        local bars_h = 7 * bar_row_h
+        local fixed = pad + 4 * header_h + 3 * section_gap + cal_h + bars_h + pad
+        local chart_h = math.max(Screen:scaleBySize(60), math.min(Screen:scaleBySize(220), avail - fixed - 2 * tiny_h))
+
+        content[#content + 1] = K.VerticalSpan:new{ width = pad }
+
+        content[#content + 1] = sectionHeader(K, _("Pages per week"), inner_w)
+        local max_pages = 1
+        for _i, w in ipairs(stats.weekly) do if w.pages > max_pages then max_pages = w.pages end end
+        local wgap = Screen:scaleBySize(6)
+        local col_w = math.floor((inner_w - 11 * wgap) / 12)
+        local chart = K.HorizontalGroup:new{ align = "bottom" }
+        local months = K.HorizontalGroup:new{ align = "top" }
+        local prev_month
+        for i, w in ipairs(stats.weekly) do
+            if i > 1 then
+                chart[#chart + 1] = K.HorizontalSpan:new{ width = wgap }
+                months[#months + 1] = K.HorizontalSpan:new{ width = wgap }
+            end
+            local bar_h = w.pages > 0 and math.max(2, math.floor(w.pages / max_pages * (chart_h - tiny_h))) or 1
+            chart[#chart + 1] = K.VerticalGroup:new{
+                align = "center",
+                w.pages > 0 and K.TextWidget:new{ text = tostring(w.pages), face = tiny, fgcolor = gray, max_width = col_w + wgap } or K.VerticalSpan:new{ width = 0 },
+                K.CenterContainer:new{ dimen = K.Geom:new{ w = col_w, h = bar_h }, box(col_w, bar_h, w.pages > 0 and 0x55 or 0xCC) },
+            }
+            local month = os.date("%b", w.start)
+            months[#months + 1] = K.LeftContainer:new{
+                dimen = K.Geom:new{ w = col_w, h = tiny_h },
+                month ~= prev_month and K.TextWidget:new{ text = month, face = tiny, fgcolor = gray } or K.VerticalSpan:new{ width = 0 },
+            }
+            prev_month = month
+        end
+        content[#content + 1] = K.VerticalGroup:new{
+            align = "left",
+            K.VerticalSpan:new{ width = math.max(0, chart_h - chart:getSize().h) },
+            chart,
+        }
+        content[#content + 1] = months
+        content[#content + 1] = K.VerticalSpan:new{ width = section_gap }
+
+        local cal = stats.calendar
+        content[#content + 1] = sectionHeader(K, T(_("Reading days · %1"), T(_("%1 days"), cal.days)), inner_w)
+        local grid = K.HorizontalGroup:new{ align = "top" }
+        local wd = { _("M"), "", _("W"), "", _("F"), "", _("S") }
+        local labels = K.VerticalGroup:new{ align = "left" }
+        for r = 1, 7 do
+            if r > 1 then labels[#labels + 1] = K.VerticalSpan:new{ width = cal_gap } end
+            labels[#labels + 1] = K.LeftContainer:new{ dimen = K.Geom:new{ w = label_w, h = cell },
+                K.TextWidget:new{ text = wd[r], face = tiny, fgcolor = gray } }
+        end
+        grid[#grid + 1] = labels
+        local cal_months = K.HorizontalGroup:new{ align = "top", K.HorizontalSpan:new{ width = label_w } }
+        prev_month = nil
+        local skip = 0
+        for wk = 0, 52 do
+            if wk > 0 then grid[#grid + 1] = K.HorizontalSpan:new{ width = cal_gap } end
+            local col = K.VerticalGroup:new{ align = "left" }
+            for r = 0, 6 do
+                if r > 0 then col[#col + 1] = K.VerticalSpan:new{ width = cal_gap } end
+                local dt = cal.first + (wk * 7 + r) * DAY
+                if dt > cal.today then
+                    col[#col + 1] = K.VerticalSpan:new{ width = cell }
+                else
+                    col[#col + 1] = box(cell, cell, SHADES[cal.level(dayKey(dt)) + 1])
+                end
+            end
+            grid[#grid + 1] = col
+            local month = os.date("%b", cal.first + wk * 7 * DAY)
+            if wk > 0 then cal_months[#cal_months + 1] = K.HorizontalSpan:new{ width = cal_gap } end
+            if wk > 0 and month ~= prev_month and skip <= 0 then
+                local tw = K.TextWidget:new{ text = month, face = tiny, fgcolor = gray }
+                local span = math.ceil(tw:getSize().w / (cell + cal_gap))
+                cal_months[#cal_months + 1] = K.LeftContainer:new{ dimen = K.Geom:new{ w = cell, h = tiny_h }, tw }
+                skip = span
+            else
+                cal_months[#cal_months + 1] = K.HorizontalSpan:new{ width = cell }
+            end
+            skip = skip - 1
+            prev_month = month
+        end
+        content[#content + 1] = grid
+        content[#content + 1] = K.VerticalSpan:new{ width = cal_gap * 2 }
+        content[#content + 1] = K.LeftContainer:new{ dimen = K.Geom:new{ w = inner_w, h = tiny_h }, cal_months }
+        content[#content + 1] = K.VerticalSpan:new{ width = section_gap }
+
+        local half_gap = Screen:scaleBySize(16)
+        local half_w = math.floor((inner_w - half_gap) / 2)
+        local function bars(title, labels_, values)
+            local max_v = 1
+            for _i, v in ipairs(values) do if v > max_v then max_v = v end end
+            local lw, vw = 0, 0
+            for i, l in ipairs(labels_) do
+                lw = math.max(lw, K.TextWidget:new{ text = l, face = small }:getSize().w)
+                vw = math.max(vw, K.TextWidget:new{ text = formatHM(values[i]), face = small }:getSize().w)
+            end
+            lw, vw = lw + Screen:scaleBySize(8), vw + Screen:scaleBySize(6)
+            local track_w = half_w - lw - vw
+            local track_h = math.max(4, math.floor(bar_row_h * 0.4))
+            local group = K.VerticalGroup:new{ align = "left", sectionHeader(K, title, half_w) }
+            for i, l in ipairs(labels_) do
+                local fill = math.floor(values[i] / max_v * track_w)
+                group[#group + 1] = K.HorizontalGroup:new{
+                    align = "center",
+                    K.LeftContainer:new{ dimen = K.Geom:new{ w = lw, h = bar_row_h }, K.TextWidget:new{ text = l, face = small, fgcolor = gray } },
+                    K.OverlapGroup:new{
+                        dimen = K.Geom:new{ w = track_w, h = track_h },
+                        box(track_w, track_h, 0xE0),
+                        box(fill, track_h, 0x55),
+                    },
+                    K.RightContainer:new{ dimen = K.Geom:new{ w = vw, h = bar_row_h }, K.TextWidget:new{ text = formatHM(values[i]), face = small } },
+                }
+            end
+            return group
+        end
+        content[#content + 1] = K.HorizontalGroup:new{
+            align = "top",
+            bars(_("Time of day"), { _("Morning"), _("Afternoon"), _("Evening"), _("Night") }, stats.tod),
+            K.HorizontalSpan:new{ width = half_gap },
+            bars(_("Day of week"), { _("Mon"), _("Tue"), _("Wed"), _("Thu"), _("Fri"), _("Sat"), _("Sun") }, stats.dow),
+        }
+        if on_longest then
+            content[#content + 1] = K.VerticalSpan:new{ width = section_gap }
+            content[#content + 1] = K.ButtonTable:new{
+                width = inner_w,
+                buttons = { { { text = _("Longest to finish"), callback = on_longest } } },
+                zero_sep = true,
+                show_parent = view,
+            }
+            content[#content + 1] = K.LineWidget:new{
+                background = K.Blitbuffer.COLOR_GRAY,
+                dimen = K.Geom:new{ w = inner_w, h = K.Size.line.medium },
+            }
+        end
+    end)
+end
+
 function CrossPointSync:registerFileDialogButtons()
     if not self.ui or not self.ui.file_chooser then return end
     local ok, FileManager = pcall(require, "apps/filemanager/filemanager")
@@ -1594,6 +2659,11 @@ end
 
 function CrossPointSync:onCrossPointSyncAll()
     self:syncAll()
+    return true
+end
+
+function CrossPointSync:onCrossPointShowLibrary()
+    self:showLibrary()
     return true
 end
 
@@ -1787,6 +2857,12 @@ end
 function CrossPointSync:settingsMenu()
     return {
         {
+            text = _("Account & server"),
+            keep_menu_open = true,
+            callback = function() self:editServer() end,
+            separator = true,
+        },
+        {
             text = _("Document match method"),
             sub_item_table = self:radioItems("match", "filename", {
                 { "filename", _("Filename (CrossPoint default)") },
@@ -1866,17 +2942,14 @@ function CrossPointSync:settingsMenu()
                     _("Seconds after the last page turn before progress is uploaded (needs \"Also push while reading\").")),
             },
         },
+        self:toggleItem(_("Dev settings"), "dev_mode", false,
+            _("Turns on developer tools, such as \"Longest to finish\" in More stats for finding books with wrong start or finish dates.")),
     }
 end
 
 function CrossPointSync:buildMenu()
     local items = {
-        {
-            text = _("Account & server"),
-            keep_menu_open = true,
-            callback = function() self:editServer() end,
-            separator = true,
-        },
+        { text = _("CrossPoint Library"), callback = function() self:showLibrary() end, separator = true },
     }
     local function add(item) items[#items + 1] = item end
 
