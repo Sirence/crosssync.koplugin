@@ -234,6 +234,8 @@ function CrossPointSync:onDispatcherRegisterActions()
         title = _("CrossPoint: sync everything"), reader = true })
     Dispatcher:registerAction("crosspoint_push_all_books", { category = "none", event = "CrossPointPushAllBooks",
         title = _("CrossPoint: push all books"), general = true, filemanager = true })
+    Dispatcher:registerAction("crosspoint_sync_all_annotations", { category = "none", event = "CrossPointSyncAllAnnotations",
+        title = _("CrossPoint: sync all highlights and bookmarks"), general = true })
 end
 
 function CrossPointSync:getSetting(key, default)
@@ -762,10 +764,58 @@ function CrossPointSync:chunked(path, items)
     return true
 end
 
-function CrossPointSync:sendAnnotations(ctx)
-    if not ctx.rolling then
-        return false, _("Highlights can only be sent for reflowable books (EPUB).")
+function CrossPointSync:pagedAnnotations(ctx, annotations)
+    local clippings, bookmarks = {}, {}
+    local total = ctx.doc_pages
+    if ctx.open then
+        local ok, n = pcall(function() return self.ui.document:getPageCount() end)
+        if ok then total = n end
     end
+    total = tonumber(total)
+    if not total or total <= 0 then return clippings, bookmarks end
+    local function pageOf(v)
+        if type(v) == "table" then return tonumber(v.page) end
+        return tonumber(v)
+    end
+    for _i, a in ipairs(annotations) do
+        local page = tonumber(a.pageno) or pageOf(a.page) or pageOf(a.pos0)
+        if page and page >= 1 then
+            local pct = clamp01(page / total)
+            local quote = a.text and a.text:gsub("%s+", " ") or ""
+            local summary = quote ~= "" and quote or (a.chapter or formatPercent(pct))
+            local loc = tostring(math.floor(page))
+            bookmarks[#bookmarks + 1] = {
+                id = sha16("page:" .. loc .. ":" .. (a.datetime or "")),
+                xpath = loc,
+                percentage = pct,
+                summary = truncateChars(summary, 256),
+                si = 0, pc = total, pp = math.floor(page) - 1,
+            }
+            if a.drawer ~= nil and quote ~= "" then
+                local end_page = pageOf(a.pos1) or page
+                local created = parseDatetime(a.datetime)
+                local text = formatPercent(pct) .. "\n\n" .. (a.text or "")
+                if #text > 2048 then text = truncateUtf8(text, 2048) end
+                local c = {
+                    id = sha16(string.format("%d", created) .. text),
+                    spine = 0,
+                    start_page = math.floor(page) - 1,
+                    end_page = math.max(math.floor(end_page), math.floor(page)) - 1,
+                    pages = total,
+                    start_word = 0, end_word = 0, words = 0,
+                    text = text,
+                    created_at = created,
+                }
+                if a.chapter and a.chapter ~= "" then c.chapter = truncateChars(a.chapter, 64) end
+                if a.note and a.note ~= "" then c.note = truncateUtf8(a.note, 4096) end
+                clippings[#clippings + 1] = c
+            end
+        end
+    end
+    return clippings, bookmarks
+end
+
+function CrossPointSync:sendAnnotations(ctx)
     local annotations = ctx.annotations
     if ctx.open and not annotations then
         return false, _("This KOReader version has no annotation list; please update.")
@@ -774,6 +824,14 @@ function CrossPointSync:sendAnnotations(ctx)
     local doc = ctx.hashes.filename
     local clippings, bookmarks = {}, {}
 
+    local paged = {}
+    for _i, a in ipairs(annotations) do
+        local xp = type(a.page) == "string" and a.page or a.pos0
+        if not (type(xp) == "string" and xp:match("^/body")) then paged[#paged + 1] = a end
+    end
+    if #paged > 0 then
+        clippings, bookmarks = self:pagedAnnotations(ctx, paged)
+    end
     for _i, a in ipairs(annotations) do
         local xp = type(a.page) == "string" and a.page or a.pos0
         if type(xp) == "string" and xp:match("^/body") then
@@ -813,13 +871,13 @@ function CrossPointSync:sendAnnotations(ctx)
     end
 
     if #clippings == 0 and #bookmarks == 0 then
-        return true, _("No highlights or bookmarks in this book.")
+        return true, _("No highlights or bookmarks in this book."), 0, 0
     end
     local ok, err = self:chunked("/api/v1/clippings/" .. doc, clippings)
     if not ok then return false, err end
     ok, err = self:chunked("/api/v1/bookmarks/" .. doc, bookmarks)
     if not ok then return false, err end
-    return true, T(_("Sent %1 highlight(s) and %2 bookmark(s)."), #clippings, #bookmarks)
+    return true, T(_("Sent %1 highlight(s) and %2 bookmark(s)."), #clippings, #bookmarks), #clippings, #bookmarks
 end
 
 function CrossPointSync:setReadingStatus(ctx, value) 
@@ -1014,7 +1072,118 @@ function CrossPointSync:statsGlobalSnapshot(snapshots)
     return g
 end
 
-function CrossPointSync:uploadStats(only_doc)
+function CrossPointSync:uploadStats(only_doc, only_md5)
+    local ok, err, empty = self:uploadTrackedStats(only_doc)
+    if self:getSetting("historical_stats", false) then
+        local hok, herr, sent = self:uploadHistoricalStats(only_md5)
+        if not hok then return false, T(_("Historical stats: %1"), tostring(herr)) end
+        if empty and sent > 0 then return true end
+    end
+    return ok, err
+end
+
+function CrossPointSync:historyTimezone()
+    local tz = self:getSetting("stats_timezone", "")
+    if tz ~= "" then return tz end
+    local function valid(v)
+        v = v and v:match("^%s*(.-)%s*$")
+        if v and (v == "UTC" or v:match("^%a+/[%w_+%-/]+$")) then return v end
+    end
+    tz = valid(os.getenv("TZ"))
+    if tz then return tz end
+    local f = io.open("/etc/timezone", "r")
+    if f then
+        tz = valid(f:read("*l"))
+        f:close()
+        if tz then return tz end
+    end
+    local ok, attr = pcall(lfs.symlinkattributes, "/etc/localtime")
+    if ok and type(attr) == "table" and type(attr.target) == "string" then
+        tz = valid(attr.target:match("zoneinfo/(.+)$"))
+        if tz then return tz end
+    end
+    return "UTC"
+end
+
+function CrossPointSync:uploadHistoricalStats(only_md5)
+    local path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+    if lfs.attributes(path, "mode") ~= "file" then
+        if only_md5 then return true, nil, 0 end
+        return false, _("No KOReader reading statistics found. Turn on Reading statistics in KOReader first."), 0
+    end
+    if only_md5 then
+        only_md5 = only_md5:lower()
+        if not only_md5:match("^[0-9a-f]+$") or #only_md5 ~= 32 then return true, nil, 0 end
+    end
+    local SQ3 = require("lua-ljsqlite3/init")
+    local conn = SQ3.open(path)
+    local function close() if conn then pcall(function() conn:close() end) conn = nil end end
+    local ok, books = pcall(function()
+        conn:exec("PRAGMA query_only=ON;")
+        local rows = conn:exec([[SELECT COALESCE(lower(md5), '') AS md5, MAX(COALESCE(title, '')) AS title,
+            MAX(COALESCE(authors, '')) AS authors FROM book
+            WHERE EXISTS (SELECT 1 FROM page_stat_data p WHERE p.id_book = book.id AND p.total_pages > 0 AND p.duration > 0)]]
+            .. (only_md5 and (" AND lower(md5) = '" .. only_md5 .. "'") or "")
+            .. " GROUP BY lower(md5) ORDER BY lower(md5)")
+        local list = {}
+        if rows then
+            for i, hash in ipairs(rows.md5) do
+                if #hash == 32 and hash:match("^[0-9a-f]+$") then
+                    list[#list + 1] = { md5 = hash, title = rows.title[i], authors = rows.authors[i] }
+                end
+            end
+        end
+        return list
+    end)
+    if not ok then close() return false, tostring(books), 0 end
+
+    local hist_sent = self:getSetting("hist_sent", {})
+    local timezone = self:historyTimezone()
+    local sent = 0
+    for _i, book in ipairs(books) do
+        local pok, pages = pcall(function()
+            local rows = conn:exec(string.format([[SELECT p.page, p.total_pages, p.start_time, MAX(p.duration) AS duration
+                FROM page_stat_data p JOIN book b ON b.id = p.id_book
+                WHERE lower(b.md5) = '%s' AND p.total_pages > 0 AND p.duration > 0
+                GROUP BY p.page, p.total_pages, p.start_time ORDER BY p.start_time, p.page, p.total_pages LIMIT 20001]], book.md5))
+            local list = {}
+            if rows then
+                for i = 1, #rows.page do
+                    list[i] = { page = tonumber(rows.page[i]), total_pages = tonumber(rows.total_pages[i]),
+                        start_time = tonumber(rows.start_time[i]), duration = tonumber(rows.duration[i]) }
+                end
+            end
+            return list
+        end)
+        if not pok then close() return false, tostring(pages), sent end
+        if #pages > 0 and #pages <= 20000 then
+            local body = json.encode({ version = 1, book = book, timezone = timezone, pages = pages })
+            local fingerprint = sha2.md5(body)
+            if hist_sent[book.md5] ~= fingerprint then
+                local code, data, err = self:request("POST", "/api/v1/stats/koreader", body)
+                if code == 409 then
+                    logger.info("CrossPointSync: history import conflict, skipped", book.title)
+                elseif not httpOk(code) then
+                    close()
+                    self:setSetting("hist_sent", hist_sent)
+                    return false, T(_("%1: %2"), book.title, reqError(code, data, err)), sent
+                elseif type(data) == "table" and data.accepted == #pages then
+                    hist_sent[book.md5] = fingerprint
+                    sent = sent + 1
+                else
+                    close()
+                    self:setSetting("hist_sent", hist_sent)
+                    return false, _("The server did not accept the history. Update the CrossPoint Sync server."), sent
+                end
+            end
+        end
+    end
+    close()
+    self:setSetting("hist_sent", hist_sent)
+    return true, nil, sent
+end
+
+function CrossPointSync:uploadTrackedStats(only_doc)
     local all, send = {}, {}
     for doc, b in pairs(self.stats.books) do
         if b.seconds > 0 or b.completed then
@@ -1024,7 +1193,7 @@ function CrossPointSync:uploadStats(only_doc)
         end
     end
     if only_doc and #send == 0 then
-        return false, _("No reading stats tracked for this book yet.")
+        return false, _("No reading stats tracked for this book yet."), true
     end
     local device_id = self:getSetting("device_id")
     for i = 1, #send, 20 do
@@ -1054,11 +1223,9 @@ function CrossPointSync:syncAll()
         local r, e = self:uploadDocumentInfo(ctx)
         lines[#lines + 1] = r and _("Book info: sent") or T(_("Book info: %1"), tostring(e))
 
-        if ctx.rolling then
-            local ok2, msg = self:sendAnnotations(ctx)
-            lines[#lines + 1] = T(_("Highlights: %1"), tostring(msg))
-            if not ok2 then logger.warn("CrossPointSync: annotations", msg) end
-        end
+        local ok2, msg = self:sendAnnotations(ctx)
+        lines[#lines + 1] = T(_("Highlights: %1"), tostring(msg))
+        if not ok2 then logger.warn("CrossPointSync: annotations", msg) end
         pcall(function() self:syncKoreaderStatus(ctx) end)
 
         if self:getSetting("send_stats", true) then
@@ -1101,7 +1268,7 @@ function CrossPointSync:bookAction(file, what)
             ok, msg = self:uploadDocumentInfo(ctx)
             if ok then msg = _("Book info sent.") end
         elseif what == "stats" then
-            ok, msg = self:uploadStats(ctx.hashes.filename)
+            ok, msg = self:uploadStats(ctx.hashes.filename, ctx.hashes.binary)
             if ok then msg = _("Reading stats sent.") end
         end
         self:notify(ok and msg or T(_("Failed: %1"), tostring(msg)), ok and 3 or 5)
@@ -1156,7 +1323,7 @@ function CrossPointSync:pushBookData(file, summary)
         end
     end
     track(self:uploadDocumentInfo(ctx))
-    if ctx.rolling and ctx.annotations and #ctx.annotations > 0 then
+    if ctx.annotations and #ctx.annotations > 0 then
         track(self:sendAnnotations(ctx))
     end
     pcall(function() self:syncKoreaderStatus(ctx) end)
@@ -1237,6 +1404,82 @@ function CrossPointSync:pushAllBooks()
     end)
 end
 
+function CrossPointSync:syncAllAnnotations()
+    self:onlineOrAsk(function(done)
+        local ReadHistory = require("readhistory")
+        local files, seen = {}, {}
+        for _i, item in ipairs(ReadHistory.hist or {}) do
+            local f = item.file
+            if f and not seen[f] and lfs.attributes(f, "mode") == "file" then
+                seen[f] = true
+                files[#files + 1] = f
+            end
+        end
+        if #files == 0 then
+            self:notify(_("No books in the reading history."))
+            return
+        end
+        local summary = { books = 0, clippings = 0, bookmarks = 0, none = 0, failed = 0, fail_streak = 0 }
+        local total, i, msg = #files, 0, nil
+        local function show(text)
+            if msg then UIManager:close(msg) end
+            msg = InfoMessage:new{ text = text }
+            UIManager:show(msg)
+            UIManager:forceRePaint()
+        end
+        local function finish(aborted)
+            if msg then UIManager:close(msg) end
+            local lines = {
+                T(_("Sent highlights and bookmarks for %1 book(s): %2 highlight(s), %3 bookmark(s)."),
+                    summary.books, summary.clippings, summary.bookmarks),
+            }
+            if aborted then table.insert(lines, 1, _("Stopped: the server could not be reached.")) end
+            if summary.none > 0 then lines[#lines + 1] = T(_("%1 book(s) without highlights or bookmarks."), summary.none) end
+            if summary.failed > 0 then lines[#lines + 1] = T(_("%1 book(s) failed."), summary.failed) end
+            self:notify(table.concat(lines, "\n"), 8)
+            done()
+        end
+        local function one(file)
+            local ctx = self:contextFor(file)
+            if not ctx or not ctx.annotations or #ctx.annotations == 0 then
+                summary.none = summary.none + 1
+                return
+            end
+            local ok, res, c, b = self:sendAnnotations(ctx)
+            if not ok then
+                summary.failed = summary.failed + 1
+                summary.fail_streak = summary.fail_streak + 1
+                logger.warn("CrossPointSync: annotations failed for", file, res)
+                return
+            end
+            summary.fail_streak = 0
+            if c and (c + b) > 0 then
+                summary.books = summary.books + 1
+                summary.clippings = summary.clippings + tonumber(c)
+                summary.bookmarks = summary.bookmarks + tonumber(b)
+            else
+                summary.none = summary.none + 1
+            end
+        end
+        local function step()
+            i = i + 1
+            if i > total then return finish(false) end
+            if summary.fail_streak >= 3 then return finish(true) end
+            show(T(_("CrossPoint highlights %1/%2\n%3"), i, total, basename(files[i])))
+            UIManager:nextTick(function()
+                local ok, err = pcall(one, files[i])
+                if not ok then
+                    summary.failed = summary.failed + 1
+                    logger.warn("CrossPointSync: annotations error", files[i], err)
+                end
+                step()
+            end)
+        end
+        step()
+        return true
+    end)
+end
+
 function CrossPointSync:registerFileDialogButtons()
     if not self.ui or not self.ui.file_chooser then return end
     local ok, FileManager = pcall(require, "apps/filemanager/filemanager")
@@ -1311,7 +1554,12 @@ function CrossPointSync:onCloseDocument()
             local ctx = self:readerContext()
             if ctx then self:syncKoreaderStatus(ctx) end
         end)
-        if self:getSetting("send_stats", true) then pcall(function() self:uploadStats() end) end
+        if self:getSetting("send_stats", true) then
+            pcall(function()
+                local ctx = self:readerContext()
+                self:uploadStats(nil, ctx and ctx.hashes.binary or "")
+            end)
+        end
     end
     if push then
         self:runOnlineBlocking(work)
@@ -1346,6 +1594,11 @@ end
 
 function CrossPointSync:onCrossPointSyncAll()
     self:syncAll()
+    return true
+end
+
+function CrossPointSync:onCrossPointSyncAllAnnotations()
+    self:syncAllAnnotations()
     return true
 end
 
@@ -1568,6 +1821,38 @@ function CrossPointSync:settingsMenu()
         self:toggleItem(_("Also store progress under the other document id"), "write_alias", true,
             _("Lets devices that match by binary hash and devices that match by filename see the same progress.")),
         self:toggleItem(_("Track and send reading stats"), "send_stats", true),
+        self:toggleItem(_("Sync historical stats (sync stats from before installation)"), "historical_stats", false,
+            _("Also uploads KOReader's own reading statistics (every recorded page and session, including reading done before this plugin was installed). Needs KOReader's Reading statistics plugin. Books already sent are skipped; the server ignores records it already has.")),
+        {
+            text_func = function() return T(_("Historical stats time zone: %1"), self:historyTimezone()) end,
+            enabled_func = function() return self:getSetting("historical_stats", false) end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local InputDialog = require("ui/widget/inputdialog")
+                local dialog
+                dialog = InputDialog:new{
+                    title = _("Time zone (e.g. Europe/Berlin or UTC)"),
+                    input = self:getSetting("stats_timezone", ""),
+                    input_hint = self:historyTimezone(),
+                    buttons = {{
+                        { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+                        {
+                            text = _("Save"),
+                            is_enter_default = true,
+                            callback = function()
+                                local v = dialog:getInputText():match("^%s*(.-)%s*$")
+                                self:setSetting("stats_timezone", v)
+                                self:setSetting("hist_sent", {})
+                                UIManager:close(dialog)
+                                if touchmenu_instance then touchmenu_instance:updateItems() end
+                            end,
+                        },
+                    }},
+                }
+                UIManager:show(dialog)
+                dialog:onShowKeyboard()
+            end,
+        },
         {
             text = _("Timing"),
             sub_item_table = {
@@ -1625,6 +1910,11 @@ function CrossPointSync:buildMenu()
             callback = function() self:pushAllBooks() end,
         }
     end
+    add{
+        text = _("Sync all highlights and bookmarks"),
+        help_text = _("Sends the highlights, notes and bookmarks of every book in the reading history, EPUB and PDF, without opening them."),
+        callback = function() self:syncAllAnnotations() end,
+    }
     add{
         text = _("Send reading stats"),
         callback = function()
